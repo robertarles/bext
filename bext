@@ -1,0 +1,339 @@
+#!/usr/bin/env python3
+"""bext: get, set, append and lint the beans-ext block of a bean.
+
+  bext get <id> [<key.path>] [--json]
+  bext set <id> <key.path> <value> [--yaml]
+  bext append <id> <key.path> [key=value | key:=<yaml> ...] [--text -] [--at <stamp>] [--no-by]
+  bext lint [<id> | <instance dir> ...]
+
+Run it from inside a beans instance (beans finds .beans.yml by searching upward). Every write goes
+through `beans update --if-match <FNV-1a 64 of the file bytes on disk>`; a stale write is re-read
+and retried, at most 3 attempts in all, then it fails loudly. A write is read back and checked.
+"""
+import argparse
+import datetime
+import getpass
+import json
+import os
+import re
+import subprocess
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+import yaml  # noqa: E402
+
+import beans_ext as bx  # noqa: E402
+
+ATTEMPTS = 3
+STALE_RX = re.compile(r"etag mismatch|text not found in body", re.I)
+
+
+def die(msg, code=1):
+    sys.stderr.write("bext: %s\n" % msg)
+    sys.exit(code)
+
+
+def beans(*args):
+    try:
+        return subprocess.run(["beans"] + list(args), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                              universal_newlines=True, timeout=60)
+    except FileNotFoundError:
+        die("beans is not on PATH")
+    except subprocess.TimeoutExpired:
+        die("beans timed out")
+
+
+def instance_root(start):
+    d = os.path.realpath(start)
+    while True:
+        if os.path.isfile(os.path.join(d, ".beans.yml")):
+            return d
+        if os.path.dirname(d) == d:
+            return None
+        d = os.path.dirname(d)
+
+
+def beans_dir(root):
+    with open(os.path.join(root, ".beans.yml"), encoding="utf-8") as f:
+        cfg = yaml.safe_load(f) or {}
+    return os.path.join(root, (cfg.get("beans") or {}).get("path", ".beans"))
+
+
+def resolve(bid):
+    """(id, absolute file path) of a bean, resolved by beans so short ids work."""
+    root = instance_root(os.getcwd())
+    if root is None:
+        die("no .beans.yml found above %s; run bext inside a beans instance" % os.getcwd())
+    p = beans("show", "--json", bid)
+    if p.returncode != 0:
+        die("beans show %s failed: %s" % (bid, p.stderr.strip() or p.stdout.strip()))
+    try:
+        j = json.loads(p.stdout)
+    except ValueError:
+        die("beans show %s gave unparseable output" % bid)
+    path = os.path.join(beans_dir(root), j["path"])
+    if not os.path.isfile(path):
+        die("bean file %s not found" % path)
+    return j["id"], path
+
+
+def read_disk(path):
+    with open(path, "rb") as f:
+        return f.read()
+
+
+def load(path):
+    """(raw bytes, text, ext or None, block or None); exits on an unusable block or stray frontmatter."""
+    raw = read_disk(path)
+    text = raw.decode("utf-8")
+    fm, _ = bx.split_file(text)
+    bad = [m for lvl, m in bx.check_frontmatter(fm) if lvl == "error"]
+    try:
+        ext, block = bx.extract(text)
+    except bx.ExtError as e:
+        die("refusing: the block in %s fails lint: %s" % (os.path.basename(path), e))
+    if bad:
+        die("refusing to write: %s" % "; ".join(bad))
+    return raw, text, ext, block
+
+
+# ------------------------------------------------------------------ paths and values
+
+def split_path(p):
+    segs = p.split(".")
+    for s in segs:
+        if not bx.KEY_RX.match(s):
+            die("key path segment %r is not lowercase snake_case (C3)" % s)
+    return segs
+
+
+def dig(ext, segs):
+    cur = ext
+    for s in segs:
+        if not isinstance(cur, dict) or s not in cur:
+            return False, None
+        cur = cur[s]
+    return True, cur
+
+
+def local_stamp():
+    return datetime.datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def default_by():
+    return os.environ.get("BEXT_AUTHOR") or getpass.getuser()
+
+
+# ------------------------------------------------------------------ the write path
+
+def write_block(bid, path, mutate, what):
+    """mutate(ext_or_None) -> new ext. Re-reads and retries when the file moved underneath."""
+    last = ""
+    for attempt in range(1, ATTEMPTS + 1):
+        raw, text, ext, block = load(path)
+        new_ext = mutate(_clone(ext))
+        errs = [m for lvl, m in bx.check_data(new_ext) if lvl == "error"]
+        if errs:
+            die("refusing to write a block that fails lint: %s" % "; ".join(errs))
+        new_block = bx.render_block(new_ext)
+        # the emitted text must parse back to the same value, or we would be writing a different block
+        chk, findings = bx.check_block_text("\n".join(new_block.split("\n")[1:-1]) + "\n")
+        if chk != new_ext or any(l == "error" for l, _ in findings):
+            die("internal error: the emitted block does not parse back to the intended value")
+        args = ["update", bid, "--if-match", bx.fnv1a64(raw)]
+        if block is None:
+            args += ["--body-append", new_block]
+        else:
+            args += ["--body-replace-old", block["raw"], "--body-replace-new", new_block]
+        p = beans(*args)
+        if p.returncode != 0:
+            last = (p.stderr.strip() or p.stdout.strip())
+            if STALE_RX.search(last):
+                continue  # the bean changed since the read; read again
+            die("beans update failed: %s" % last)
+        try:
+            back = bx.extract(read_disk(path).decode("utf-8"))[0]
+        except bx.ExtError as e:
+            die("read-back: the block no longer parses after the write: %s" % e)
+        if back != new_ext:
+            die("read-back: beans reported success but the file does not hold the change (%s)" % what)
+        return new_ext
+    die("gave up after %d attempts: %s is still changing (last error: %s)" % (ATTEMPTS, bid, last))
+
+
+def _clone(ext):
+    if ext is None:
+        return None
+    return json.loads(json.dumps(ext))
+
+
+# ------------------------------------------------------------------ commands
+
+def cmd_get(a):
+    bid, path = resolve(a.id)
+    _, _, ext, _ = load(path)
+    if ext is None:
+        die("%s has no beans-ext block" % bid)
+    val = ext
+    if a.path:
+        ok, val = dig(ext, split_path(a.path))
+        if not ok:
+            die("no value at %s in %s" % (a.path, bid))
+    if a.json:
+        print(json.dumps(val, ensure_ascii=False))
+    elif isinstance(val, (dict, list)):
+        sys.stdout.write(bx.dump_ext(val))
+    elif isinstance(val, str):
+        print(val)
+    else:
+        print(json.dumps(val))
+    return 0
+
+
+def cmd_set(a):
+    segs = split_path(a.path)
+    value = a.value
+    if a.yaml:
+        try:
+            value = bx.load_ext(a.value)
+        except yaml.YAMLError as e:
+            die("--yaml value does not parse: %s" % str(e).replace("\n", " "))
+    bid, path = resolve(a.id)
+
+    def mutate(ext):
+        ext = {"ext": 1} if ext is None else ext
+        cur = ext
+        for s in segs[:-1]:
+            nxt = cur.get(s)
+            if nxt is None:
+                nxt = cur[s] = {}
+            if not isinstance(nxt, dict):
+                die("cannot set %s: %s is not a mapping" % (a.path, s))
+            cur = nxt
+        cur[segs[-1]] = value
+        return ext
+
+    write_block(bid, path, mutate, "set %s" % a.path)
+    return 0
+
+
+def cmd_append(a):
+    segs = split_path(a.path)
+    entry = {}
+    if a.at is not None and not bx.OFFSET_RX.match(a.at):
+        die("--at %r must be ISO 8601 local time with a +-HH:MM offset (H2)" % a.at)
+    entry["at"] = a.at or local_stamp()
+    if not a.no_by:
+        entry["by"] = default_by()
+    for kv in a.pairs:
+        m = re.match(r"^([^=:]+)(:?=)(.*)$", kv, re.S)
+        if not m:
+            die("%r is not key=value or key:=<yaml>" % kv)
+        k, op, v = m.groups()
+        if not bx.KEY_RX.match(k):
+            die("entry key %r is not lowercase snake_case (C3)" % k)
+        if k == "at":
+            die("use --at to set the stamp")
+        if op == ":=":
+            try:
+                v = bx.load_ext(v)
+            except yaml.YAMLError as e:
+                die("%s value does not parse: %s" % (k, str(e).replace("\n", " ")))
+        entry[k] = v
+    if a.text is not None:
+        if a.text != "-":
+            die("--text takes '-' (read the text from stdin)")
+        entry["text"] = sys.stdin.read()
+    bid, path = resolve(a.id)
+
+    def mutate(ext):
+        ext = {"ext": 1} if ext is None else ext
+        cur = ext
+        for s in segs[:-1]:
+            nxt = cur.get(s)
+            if nxt is None:
+                nxt = cur[s] = {}
+            if not isinstance(nxt, dict):
+                die("cannot append to %s: %s is not a mapping" % (a.path, s))
+            cur = nxt
+        lst = cur.get(segs[-1])
+        if lst is None:
+            lst = cur[segs[-1]] = []
+        if not isinstance(lst, list):
+            die("cannot append to %s: it is not a list" % a.path)
+        lst.append(dict(entry))
+        return ext
+
+    write_block(bid, path, mutate, "append %s" % a.path)
+    return 0
+
+
+def bean_files(root):
+    d = beans_dir(root)
+    for sub in (d, os.path.join(d, "archive")):
+        if os.path.isdir(sub):
+            for n in sorted(os.listdir(sub)):
+                if n.endswith(".md"):
+                    yield n.split("--")[0], os.path.join(sub, n)
+
+
+def cmd_lint(a):
+    targets = []
+    if not a.targets:
+        root = instance_root(os.getcwd())
+        if root is None:
+            die("no .beans.yml found above %s" % os.getcwd())
+        targets = list(bean_files(root))
+    for t in a.targets:
+        if os.path.isdir(t):
+            root = instance_root(t)
+            if root is None:
+                die("%s is not inside a beans instance" % t)
+            targets += list(bean_files(root))
+        else:
+            targets.append(resolve(t))
+    errors = 0
+    for bid, path in targets:
+        try:
+            text = read_disk(path).decode("utf-8")
+        except UnicodeDecodeError as e:
+            print("%s: error: not UTF-8: %s" % (bid, e))
+            errors += 1
+            continue
+        for lvl, msg in bx.lint_text(text):
+            print("%s: %s: %s" % (bid, "error" if lvl == "error" else "warn", msg))
+            errors += lvl == "error"
+    return 1 if errors else 0
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="bext", description="get, set, append and lint a bean's beans-ext block")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    g = sub.add_parser("get")
+    g.add_argument("id")
+    g.add_argument("path", nargs="?")
+    g.add_argument("--json", action="store_true")
+    g.set_defaults(fn=cmd_get)
+    s = sub.add_parser("set")
+    s.add_argument("id")
+    s.add_argument("path")
+    s.add_argument("value")
+    s.add_argument("--yaml", action="store_true", help="parse the value as YAML instead of a string")
+    s.set_defaults(fn=cmd_set)
+    p = sub.add_parser("append")
+    p.add_argument("id")
+    p.add_argument("path")
+    p.add_argument("pairs", nargs="*", help="key=value (string) or key:=<yaml>")
+    p.add_argument("--text", help="'-' reads the entry's text from stdin")
+    p.add_argument("--at", help="stamp with a +-HH:MM offset (default: now, local)")
+    p.add_argument("--no-by", action="store_true")
+    p.set_defaults(fn=cmd_append)
+    l = sub.add_parser("lint")
+    l.add_argument("targets", nargs="*", help="bean ids or instance directories (default: this instance)")
+    l.set_defaults(fn=cmd_lint)
+    a = ap.parse_args()
+    sys.exit(a.fn(a))
+
+
+if __name__ == "__main__":
+    main()
